@@ -1,0 +1,5 @@
+aiogram==3.4
+gspread
+google-auth
+python-dotenv
+pillow
