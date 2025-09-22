@@ -1,4 +1,4 @@
-# main.py — version PayPal.me
+# main.py — Telegram bot (PayPal.me) + MP direct pour "photo de modèle"
 import os, asyncio, time, urllib.parse
 from pathlib import Path
 from aiogram import Bot, Dispatcher, F
@@ -7,7 +7,7 @@ from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
     ReplyKeyboardMarkup, KeyboardButton, InputMediaPhoto
 )
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from dotenv import load_dotenv
 
 from sheets import list_categories, list_products, get_product, get_image_for, append_order
@@ -38,7 +38,6 @@ SUPPORT_URL_ENV = os.getenv("SUPPORT_URL", "").strip()
 
 # --- PayPal.me ---
 PAYPAL_ME = os.getenv("PAYPAL_ME", "").strip().replace("https://paypal.me/", "").replace("paypal.me/", "").lstrip("/")
-# (doit être rempli)
 if not PAYPAL_ME:
     print("[WARN] PAYPAL_ME est vide. Configure-le dans .env pour activer le paiement.")
 
@@ -48,7 +47,6 @@ dp = Dispatcher()
 PAGE_SIZE = 4
 
 # ----- États -----
-# _stage: "name" -> "phone" -> "address"
 user_checkout = {}          # uid -> {"_active": True, "_stage": "...", "name","phone","address"}
 checkout_prompt = {}        # uid -> "name" | "phone" | "address"
 manual_size_wait = {}       # uid -> {"pid":..., "color":...}
@@ -107,13 +105,9 @@ def post_add_kb():
 
 # --------- PayPal.me ----------
 def paypal_link(order_id: int, total_cents: int) -> str | None:
-    """
-    Lien PayPal.me avec montant pré-rempli.
-    (Le type « Entre proches » ne peut pas être imposé par URL ; le client le choisit dans l'app si disponible.)
-    """
     if not PAYPAL_ME:
         return None
-    amount = f"{total_cents/100:.2f}"  # "12.34"
+    amount = f"{total_cents/100:.2f}"
     return f"https://www.paypal.me/{PAYPAL_ME}/{amount}"
 
 def payment_kb(order_id: int, total_cents: int):
@@ -142,6 +136,22 @@ def format_user(m: Message) -> str:
     name = f"{(u.first_name or '').strip()} {(u.last_name or '').strip()}".strip()
     return f"{name} {handle} • id:{u.id}"
 
+# --- helpers pour MP direct (nouveau) ---
+def format_user_from(u) -> str:
+    handle = f"@{u.username}" if getattr(u, "username", None) else "(sans pseudo)"
+    name = f"{(getattr(u, 'first_name', '') or '').strip()} {(getattr(u, 'last_name', '') or '').strip()}".strip()
+    return f"{name} {handle} • id:{u.id}"
+
+def prefilled_share_link_for_user(u) -> str:
+    txt = (
+        "Demande modèle (via le bot):\n"
+        f"Utilisateur: {format_user_from(u)}\n"
+        "Modèle souhaité: (décris le modèle ici)\n"
+        "Taille souhaitée: ____\n"
+        "Ajoute la photo du modèle en pièce jointe."
+    )
+    return "https://t.me/share/url?url=&text=" + urllib.parse.quote(txt)
+
 # --------- checkout helpers ---------
 
 def _get_or_init_checkout(uid: int):
@@ -156,7 +166,7 @@ def stage_set(uid: int, stage: str):
     u["_active"] = True
     u["_stage"] = stage
     user_checkout[uid] = u
-    checkout_prompt[uid] = stage  # filet de sécurité
+    checkout_prompt[uid] = stage
 
 async def prompt_name(m: Message):
     stage_set(m.from_user.id, "name")
@@ -265,12 +275,15 @@ async def debug_admins(m: Message):
 @dp.message(CommandStart())
 async def start(m: Message):
     if m.from_user.id in ADMINS:
-        await m.answer("✅ Admin reconnu : vous recevrez les notifications en MP.")
+        try:
+            await m.answer("✅ Admin reconnu : vous recevrez les notifications en MP.")
+        except TelegramNetworkError:
+            pass
     await m.answer(
         "👟 *Bienvenue à L’atelier de la chaussure !*\n\n"
         "🛍️ Feuillette le catalogue et passe commande directement ici.\n"
         "🚚 *Expédition* : entre **10 et 15 jours** après confirmation.\n"
-        "📸 Tu peux aussi m’envoyer la *photo d’un modèle* + ta *taille* : je te confirme la dispo.\n\n"
+        "📸 Tu peux aussi envoyer *en privé* la *photo d’un modèle* + ta *taille* à un conseiller.\n\n"
         "Commandes utiles :\n"
         "• /catalogue – Voir les catégories\n"
         "• /panier – Voir le panier\n"
@@ -296,17 +309,31 @@ async def cb_help(cb: CallbackQuery):
 async def browse_again(cb: CallbackQuery):
     await cb.message.answer("Choisis une catégorie :", reply_markup=cat_kb())
 
+# ---------- NOUVEAU : bouton "photo de modèle" => MP direct + message pré-rempli ----------
 @dp.callback_query(F.data == "custom:askphoto")
 async def ask_photo(cb: CallbackQuery):
+    url_admin = support_url()
+    share_url = prefilled_share_link_for_user(cb.from_user)
+
+    rows = []
+    if url_admin:
+        rows.append([InlineKeyboardButton(text="👤 Ouvrir MP avec un conseiller", url=url_admin)])
+    rows.append([InlineKeyboardButton(text="📝 Message pré-rempli", url=share_url)])
+    rows.append([InlineKeyboardButton(text="⬅️ Retour au catalogue", callback_data="browse")])
+    rows.append(kb_support_row())
+
     await cb.message.answer(
-        "📸 Envoie *une photo du modèle* qui t’intéresse.\n"
-        "Je te demanderai ensuite *ta taille*.",
+        "📩 Ouvre notre *conversation privée*, puis envoie *la photo du modèle* + ta *taille*.\n"
+        "Tu peux cliquer sur *Message pré-rempli* pour aller plus vite.",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ Retour au catalogue", callback_data="browse")],
-            kb_support_row()
-        ])
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
     )
+
+    try:
+        who = format_user_from(cb.from_user)
+        await notify_admins_text(f"🔔 {who} souhaite envoyer *un modèle en MP* (photo + taille).", parse_mode="Markdown")
+    except Exception as e:
+        print(f"[ADMIN NOTIFY ERROR] {e}")
 
 # ---------- Catalogue / Produits ----------
 
@@ -348,7 +375,13 @@ async def cat_list(cb: CallbackQuery):
     else:
         await safe_edit(cb, caption, reply_markup=kb)
 
-# ---------- Sélection produit: coloris -> saisie manuelle de taille ----------
+# ---------- Sélection produit: coloris -> VALIDATION -> saisie de taille ----------
+
+def colors_keyboard(pid: int, colors: list[str]) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=c, callback_data=f"color:{pid}:{urllib.parse.quote(c, safe='')}")] for c in colors]
+    rows.append([InlineKeyboardButton(text="⬅️ Retour au catalogue", callback_data="browse")])
+    rows.append(kb_support_row())
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 @dp.callback_query(F.data.startswith("add:"))
 async def add_choose_options(cb: CallbackQuery):
@@ -358,10 +391,7 @@ async def add_choose_options(cb: CallbackQuery):
         await cb.answer("Produit introuvable", show_alert=True); return
 
     if p.get("colors"):
-        rows = [[InlineKeyboardButton(text=c, callback_data=f"color:{pid}:{urllib.parse.quote(c, safe='')}")] for c in p["colors"]]
-        rows.append([InlineKeyboardButton(text="⬅️ Retour au catalogue", callback_data="browse")])
-        rows.append(kb_support_row())
-        await cb.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+        await cb.message.edit_reply_markup(reply_markup=colors_keyboard(pid, p["colors"]))
         await cb.answer("Choisis un coloris", show_alert=False)
     else:
         manual_size_wait[cb.from_user.id] = {"pid": pid, "color": None}
@@ -379,39 +409,74 @@ async def choose_color(cb: CallbackQuery):
     if not p:
         await cb.answer("Produit introuvable", show_alert=True); return
 
+    # Afficher l'image du coloris + demander validation
     img = get_image_for(p, color)
     caption = (
-        f"**{p['name']}**\nCouleur: {color}\n"
-        f"Prix: {money(p['price_cents'])}\n"
-        f"✍️ Maintenant, entre ta *taille* au clavier."
+        f"**{p['name']}**\n"
+        f"Couleur choisie: *{color}*\n"
+        f"Prix: {money(p['price_cents'])}\n\n"
+        "Valider ce coloris ?"
     )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Valider ce coloris", callback_data=f"confirm_color:{pid}:{color_enc}")],
+        [InlineKeyboardButton(text="↩️ Choisir un autre coloris", callback_data=f"colors:{pid}")],
+        [InlineKeyboardButton(text="⬅️ Retour au catalogue", callback_data="browse")],
+        kb_support_row()
+    ])
     try:
         if img:
             await cb.message.edit_media(InputMediaPhoto(media=img, caption=caption, parse_mode="Markdown"))
+            await cb.message.edit_reply_markup(reply_markup=kb)
         else:
-            await safe_edit(cb, caption)
+            await safe_edit(cb, caption, reply_markup=kb)
     except TelegramBadRequest:
-        await safe_edit(cb, caption)
+        await safe_edit(cb, caption, reply_markup=kb)
 
+@dp.callback_query(F.data.startswith("colors:"))
+async def list_colors_again(cb: CallbackQuery):
+    pid = int(cb.data.split(":")[1])
+    p = get_product(pid)
+    if not p or not p.get("colors"):
+        await cb.answer("Aucun coloris disponible.", show_alert=True)
+        return
+    await cb.message.edit_reply_markup(reply_markup=colors_keyboard(pid, p["colors"]))
+
+@dp.callback_query(F.data.startswith("confirm_color:"))
+async def confirm_color(cb: CallbackQuery):
+    _, pid_str, color_enc = cb.data.split(":")
+    pid = int(pid_str)
+    color = urllib.parse.unquote(color_enc)
+    p = get_product(pid)
+    if not p:
+        await cb.answer("Produit introuvable", show_alert=True); return
+
+    # Après validation, on demande la taille (saisie manuelle)
     manual_size_wait[cb.from_user.id] = {"pid": pid, "color": color}
-    await cb.message.answer("✍️ *Étape 1/1* — Écris ta *taille* (ex: `42 EU`, `27.5`, `M`, etc.) :", parse_mode="Markdown")
+    await cb.message.answer(
+        "✍️ *Étape 1/1* — Écris ta *taille* (ex: `42 EU`, `27.5`, `M`, etc.) :",
+        parse_mode="Markdown"
+    )
     await cb.message.answer("Ou reviens au catalogue :", reply_markup=InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="⬅️ Retour au catalogue", callback_data="browse")], kb_support_row()]
     ))
 
-# ---------- Réception d'une PHOTO (modèle perso) ----------
+# ---------- Réception d'une PHOTO (si l’utilisateur envoie au bot) ----------
 @dp.message(F.photo & ~F.via_bot)
 async def on_photo(m: Message):
-    file_id = m.photo[-1].file_id
-    custom_model_wait[m.from_user.id] = {"file_id": file_id, "caption": (m.caption or "").strip()}
+    url_admin = support_url()
+    share_url = prefilled_share_link_for_user(m.from_user)
+    rows = []
+    if url_admin:
+        rows.append([InlineKeyboardButton(text="👤 Ouvrir MP avec un conseiller", url=url_admin)])
+    rows.append([InlineKeyboardButton(text="📝 Message pré-rempli", url=share_url)])
+    rows.append([InlineKeyboardButton(text="⬅️ Retour au catalogue", callback_data="browse")])
+    rows.append(kb_support_row())
+
     await m.answer(
-        "📸 Photo bien reçue.\n"
-        "✍️ Indique maintenant ta *taille* pour ce modèle (ex: `42 EU`, `27.5`, `M`, etc.).",
+        "🙏 Merci pour la photo ! Pour un traitement rapide, *ouvre notre MP* et renvoie *la photo du modèle* avec ta *taille*.\n"
+        "Utilise le *message pré-rempli* pour gagner du temps.",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ Retour au catalogue", callback_data="browse")],
-            kb_support_row()
-        ])
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
     )
 
 # ---------- Réception des MESSAGES TEXTE ----------
@@ -438,41 +503,7 @@ async def on_text(m: Message):
         await m.answer("Que souhaites-tu faire ?", reply_markup=post_add_kb())
         return
 
-    # 2) Taille pour PHOTO modèle perso (si pas en checkout)
-    if uid in custom_model_wait and not stage_hint:
-        entry = custom_model_wait.pop(uid)
-        size_text = m.text.strip()
-        who = format_user(m)
-        cap_user = (
-            "📥 *Demande modèle (photo)*\n"
-            f"De: {who}\n"
-            f"Taille demandée: {size_text}\n"
-            f"Commentaire: {entry.get('caption') or '—'}"
-        )
-        ok = 0
-        for admin in ADMINS:
-            try:
-                await bot.send_photo(admin, photo=entry["file_id"], caption=cap_user, parse_mode="Markdown"); ok += 1
-            except Exception:
-                try:
-                    await bot.send_message(admin, cap_user, parse_mode="Markdown"); ok += 1
-                except Exception as e2:
-                    print(f"[ADMIN NOTIFY ERROR] {e2}")
-        if ok == 0:
-            await m.answer(
-                "⚠️ Je n’ai pas pu notifier l’admin. Vérifie `ADMINS` et que l’admin a bien *démarré le bot* (/start).",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Retour au catalogue", callback_data="browse")], kb_support_row()])
-            ); return
-        await m.answer(
-            "👍 Bien reçu ! On vérifie la disponibilité et on te répond rapidement.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="⬅️ Retour au catalogue", callback_data="browse")],
-                [InlineKeyboardButton(text="📦 Voir panier", callback_data="cart:view")],
-                kb_support_row()
-            ])
-        ); return
-
-    # 3) CHECKOUT
+    # 2) CHECKOUT
     if user_checkout.get(uid, {}).get("_active") or stage_hint:
         stage = stage_get(uid) or stage_hint
         if stage == "name":
@@ -490,7 +521,7 @@ async def on_text(m: Message):
             _get_or_init_checkout(uid); user_checkout[uid]["address"] = m.text.strip()
             await finalize_order(m, uid); return
 
-    # 4) Message libre
+    # 3) Message libre
     await m.answer(
         "Besoin d’aide ? /help\n\n• /catalogue – Catégories\n• /panier – Voir le panier\n• /commander – Finaliser",
         parse_mode="Markdown",
@@ -609,10 +640,27 @@ async def finalize_order(m: Message, uid: int):
         inline_keyboard=[[InlineKeyboardButton(text="⬅️ Retour au catalogue", callback_data="browse")], kb_support_row()])
     )
 
+# ---------- PayPal aide ----------
+@dp.callback_query(F.data.startswith("paypal:howto:"))
+async def paypal_howto(cb: CallbackQuery):
+    try:
+        _, _, order_id = cb.data.split(":")
+    except ValueError:
+        order_id = "?"
+    await cb.message.answer(
+        "📝 *Payer via PayPal « entre proches »*\n"
+        "1) Ouvre le lien PayPal.me.\n"
+        "2) Connecte-toi si besoin.\n"
+        "3) Si l’option apparaît, choisis **Entre proches** (elle peut varier selon pays/type de compte).\n"
+        f"4) Dans la *note*, indique: `Commande #{order_id}`.\n\n"
+        "⚠️ L’option « entre proches » n’est pas disponible partout et enlève la protection d’achat.",
+        parse_mode="Markdown"
+    )
+
 # ---------------------------- Run ----------------------------
 
 async def main():
-    await dp.start_polling(bot)
+    await dp.start_polling(bot, polling_timeout=60)
 
 if __name__ == "__main__":
     asyncio.run(main())
