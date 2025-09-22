@@ -3,3 +3,6 @@ gspread
 google-auth
 python-dotenv
 pillow
+fastapi
+uvicorn
+
